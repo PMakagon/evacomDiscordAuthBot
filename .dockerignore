@@ -1,0 +1,9 @@
+﻿.git
+.idea
+venv
+.venv
+__pycache__
+*.pyc
+.env
+commands
+run.ps1
