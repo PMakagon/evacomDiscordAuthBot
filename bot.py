@@ -1,4 +1,6 @@
 ﻿import os
+from pathlib import Path
+from dotenv import load_dotenv
 import time
 import hmac
 import hashlib
@@ -7,6 +9,10 @@ import re
 import asyncio
 import discord
 from discord import app_commands
+
+# Load .env from bot.py directory (root) if present.
+# Does NOT override already set environment variables (launcher keeps priority).
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 # =========================
 # CONFIG (ENV)
@@ -75,13 +81,26 @@ guild_obj = discord.Object(id=GUILD_ID)
 
 evacom = app_commands.Group(name="evacom", description="Evacom™ authorization commands")
 
+# =========================
+# Safe reply helper (works for slash + buttons + modals)
+# =========================
+async def reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except discord.InteractionResponded:
+        await interaction.followup.send(content, ephemeral=ephemeral)
+
 async def guard(interaction: discord.Interaction) -> bool:
     if interaction.guild is None or interaction.guild_id != GUILD_ID:
-        await interaction.response.send_message("Use this command inside the server.", ephemeral=True)
+        await reply(interaction, "Use this command inside the server.", ephemeral=True)
         return False
 
     if interaction.channel_id != LINK_CHANNEL_ID:
-        await interaction.response.send_message(
+        await reply(
+            interaction,
             "Authorization is only available in the Evacom™ link channel.",
             ephemeral=True
         )
@@ -89,8 +108,10 @@ async def guard(interaction: discord.Interaction) -> bool:
 
     return True
 
-@evacom.command(name="link", description="Get an ACCESS KEY to authorize Evacom™ in-game.")
-async def evacom_link(interaction: discord.Interaction):
+# =========================
+# Core handlers (REUSED by slash + buttons + modal)
+# =========================
+async def handle_evacom_link(interaction: discord.Interaction):
     if not await guard(interaction):
         return
 
@@ -99,12 +120,12 @@ async def evacom_link(interaction: discord.Interaction):
 
     role = guild.get_role(AUTHORIZED_ROLE_ID)
     if role is None:
-        await interaction.response.send_message("Bot misconfigured: Authorized role not found.", ephemeral=True)
+        await reply(interaction, "Bot misconfigured: Authorized role not found.", ephemeral=True)
         return
 
     member = interaction.user
     if isinstance(member, discord.Member) and role in member.roles:
-        await interaction.response.send_message("Evacom™ status: already authorized.", ephemeral=True)
+        await reply(interaction, "Evacom™ status: already authorized.", ephemeral=True)
         return
 
     now = time.time()
@@ -112,16 +133,17 @@ async def evacom_link(interaction: discord.Interaction):
 
     if st and st.get("cooldown", 0) > now:
         wait = int(st["cooldown"] - now)
-        await interaction.response.send_message(f"Please wait {wait}s and try again.", ephemeral=True)
+        await reply(interaction, f"Please wait {wait}s and try again.", ephemeral=True)
         return
 
     if st and not is_expired(st["created"]):
         access = make_access_key(st["nonce"])
         st["cooldown"] = now + COOLDOWN_SECONDS
         left = _time_left(st["created"])
-        await interaction.response.send_message(
+        await reply(
+            interaction,
             f"ACCESS KEY: `{format_access(access)}`\n"
-            f"Submit the key in the Evacom™ Service Console to receive your Evacom™ ID (example: B-123456`)\n"
+            f"Submit the key in the Evacom™ Service Console to receive your Evacom™ ID (example: `B-123456`)\n"
             f"Key expires in {left}s.",
             ephemeral=True
         )
@@ -136,45 +158,45 @@ async def evacom_link(interaction: discord.Interaction):
     }
 
     access = make_access_key(nonce)
-    await interaction.response.send_message(
+    await reply(
+        interaction,
         f"ACCESS KEY: `{format_access(access)}`\n"
         f"Enter it in-game to receive your Evacom™ ID (example: `B-123456`).\n"
         f"Expires in {TTL_SECONDS}s.",
         ephemeral=True
     )
 
-@evacom.command(name="verify", description="Verify your Evacom™ ID from the game (e.g., B-123456).")
-@app_commands.describe(code="Your Evacom™ ID from the game, e.g. B-123456")
-async def evacom_verify(interaction: discord.Interaction, code: str):
+async def handle_evacom_verify(interaction: discord.Interaction, code: str):
     if not await guard(interaction):
         return
 
     st = pending.get(interaction.user.id)
     if not st:
-        await interaction.response.send_message("No active session. Use `/EVACOM LINK` first.", ephemeral=True)
+        await reply(interaction, "No active session. Use `/EVACOM LINK` first.", ephemeral=True)
         return
 
     if is_expired(st["created"]):
         pending.pop(interaction.user.id, None)
-        await interaction.response.send_message("Session expired. Use `/EVACOM LINK` to get a new ACCESS KEY.", ephemeral=True)
+        await reply(interaction, "Session expired. Use `/EVACOM LINK` to get a new ACCESS KEY.", ephemeral=True)
         return
 
     if st["attempts"] >= MAX_ATTEMPTS:
         pending.pop(interaction.user.id, None)
-        await interaction.response.send_message("Too many attempts. Use `/EVACOM LINK` to start again.", ephemeral=True)
+        await reply(interaction, "Too many attempts. Use `/EVACOM LINK` to start again.", ephemeral=True)
         return
 
     digits = extract_6digits(code)
     if not digits:
         st["attempts"] += 1
-        await interaction.response.send_message("Invalid format. Expected like `B-123456`.", ephemeral=True)
+        await reply(interaction, "Invalid format. Expected like `B-123456`.", ephemeral=True)
         return
 
     expected = make_response_code(st["nonce"])
     if digits != expected:
         st["attempts"] += 1
         tries_left = max(MAX_ATTEMPTS - st["attempts"], 0)
-        await interaction.response.send_message(
+        await reply(
+            interaction,
             f"Wrong Evacom™ ID. Check digits and try again. Attempts left: {tries_left}.",
             ephemeral=True
         )
@@ -185,7 +207,7 @@ async def evacom_verify(interaction: discord.Interaction, code: str):
 
     role = guild.get_role(AUTHORIZED_ROLE_ID)
     if role is None:
-        await interaction.response.send_message("Bot misconfigured: Authorized role not found.", ephemeral=True)
+        await reply(interaction, "Bot misconfigured: Authorized role not found.", ephemeral=True)
         return
 
     member = interaction.user
@@ -195,7 +217,126 @@ async def evacom_verify(interaction: discord.Interaction, code: str):
     await member.add_roles(role, reason="Evacom™ authorized")
     pending.pop(interaction.user.id, None)
 
-    await interaction.response.send_message("Your Evacom™ successfully authorized. Community Status updated: **AUTHORIZED**", ephemeral=True)
+    await reply(
+        interaction,
+        "Your Evacom™ successfully authorized. Community Status updated: **AUTHORIZED**",
+        ephemeral=True
+    )
+
+# =========================
+# PANEL UI (Buttons + VERIFY Modal)
+# =========================
+PANEL_HEADER = "**EVACOM AUTHORIZATION TERMINAL**"
+PANEL_MESSAGE = (
+    f"{PANEL_HEADER}\n\n"
+    "Use this channel to link and **AUTHORIZE** your Evacom™.\n"
+    "Commands here are **private** — only you can see the bot’s replies\n\n"
+    "**STEP 1** — request an ACCESS KEY  \n"
+    "`/EVACOM LINK`\n\n"
+    "**STEP 2** — in-game, open `PARAMS\\SERVICES`, enter the code in the **SERVICE CONSOLE**, then press **E**  \n"
+    "Copy your  Evacom™ ID (example: `B-123456`)\n\n"
+    "**STEP 3** — verify your  Evacom™ ID here  \n"
+    "`/EVACOM VERIFY B-123456`\n\n"
+    "If your session expires, just run `/EVACOM LINK` again"
+)
+
+class EvacomVerifyModal(discord.ui.Modal, title="EVACOM™ VERIFY"):
+    code = discord.ui.TextInput(
+        label="Evacom™ ID",
+        placeholder="B-123456",
+        required=True,
+        max_length=32
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await handle_evacom_verify(interaction, str(self.code))
+        except Exception as e:
+            print(f"[Modal VERIFY] error: {e}")
+            await reply(interaction, "Internal error. Please try again.", ephemeral=True)
+
+class EvacomPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistent
+
+    @discord.ui.button(
+        label="/EVACOM LINK",
+        style=discord.ButtonStyle.success,
+        custom_id="evacom:panel:link"
+    )
+    async def link_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await handle_evacom_link(interaction)
+        except Exception as e:
+            print(f"[Panel LINK] error: {e}")
+            await reply(interaction, "Internal error. Please try again.", ephemeral=True)
+
+    @discord.ui.button(
+        label="/EVACOM VERIFY",
+        style=discord.ButtonStyle.primary,
+        custom_id="evacom:panel:verify"
+    )
+    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await guard(interaction):
+            return
+        await interaction.response.send_modal(EvacomVerifyModal())
+
+async def upsert_panel_message(channel: discord.abc.Messageable):
+    """
+    Find existing panel message from the bot and edit it.
+    If not found, send a new one.
+    """
+    if not isinstance(channel, discord.TextChannel):
+        # fetch_channel returns proper TextChannel; but keep safe
+        await channel.send(PANEL_MESSAGE, view=EvacomPanelView())
+        return
+
+    me = channel.guild.me
+    # fallback for some cases
+    bot_user_id = client.user.id if client.user else None
+    limit = 50
+
+    async for msg in channel.history(limit=limit):
+        if msg.author is None:
+            continue
+        if bot_user_id is not None and msg.author.id != bot_user_id:
+            continue
+        # Identify the panel by header in content
+        if msg.content and msg.content.strip().startswith(PANEL_HEADER):
+            await msg.edit(content=PANEL_MESSAGE, view=EvacomPanelView())
+            return
+
+    await channel.send(PANEL_MESSAGE, view=EvacomPanelView())
+
+@evacom.command(name="panel", description="Post or update EVACOM AUTHORIZATION TERMINAL panel (admin only).")
+async def evacom_panel(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.guild_id != GUILD_ID:
+        await reply(interaction, "Use this command inside the server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await reply(interaction, "Admin only.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    channel = guild.get_channel(LINK_CHANNEL_ID)
+    if channel is None:
+        channel = await guild.fetch_channel(LINK_CHANNEL_ID)
+
+    await upsert_panel_message(channel)
+    await reply(interaction, "Panel updated.", ephemeral=True)
+
+# =========================
+# Slash commands (call handlers)
+# =========================
+@evacom.command(name="link", description="Get an ACCESS KEY to authorize Evacom™ in-game.")
+async def evacom_link(interaction: discord.Interaction):
+    await handle_evacom_link(interaction)
+
+@evacom.command(name="verify", description="Verify your Evacom™ ID from the game (e.g., B-123456).")
+@app_commands.describe(code="Your Evacom™ ID from the game, e.g. B-123456")
+async def evacom_verify(interaction: discord.Interaction, code: str):
+    await handle_evacom_verify(interaction, code)
 
 async def cleanup_loop():
     await client.wait_until_ready()
@@ -208,7 +349,8 @@ async def cleanup_loop():
 
 @client.event
 async def setup_hook():
-    # Guild-only commands (instant)
+    client.add_view(EvacomPanelView())  # persistent buttons survive restarts
+
     tree.add_command(evacom, guild=guild_obj)
     await tree.sync(guild=guild_obj)
     asyncio.create_task(cleanup_loop())
